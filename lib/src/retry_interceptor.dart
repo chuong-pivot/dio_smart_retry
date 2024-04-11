@@ -11,25 +11,23 @@ typedef RetryEvaluator = FutureOr<bool> Function(
   int attempt,
 );
 
+typedef RetryResEvaluator = FutureOr<bool> Function(
+  Response<dynamic> response,
+  int attempt,
+);
+
 /// An interceptor that will try to send failed request again
 class RetryInterceptor extends Interceptor {
   RetryInterceptor({
     required this.dio,
     this.logPrint,
-    this.retries = 3,
-    this.retryDelays = const [
-      Duration(seconds: 1),
-      Duration(seconds: 3),
-      Duration(seconds: 5),
-    ],
-    RetryEvaluator? retryEvaluator,
+    this.retries = 1,
+    this.retryDelays = const [Duration(seconds: 1)],
+    this.retryEvaluator,
+    this.retryResEvaluator,
     this.ignoreRetryEvaluatorExceptions = false,
     this.retryableExtraStatuses = const {},
-  }) : _retryEvaluator = retryEvaluator ??
-            DefaultRetryEvaluator({
-              ...defaultRetryableStatuses,
-              ...retryableExtraStatuses,
-            }).evaluate {
+  }) {
     if (retryEvaluator != null && retryableExtraStatuses.isNotEmpty) {
       throw ArgumentError(
         '[retryableExtraStatuses] works only if [retryEvaluator] is null.'
@@ -58,7 +56,7 @@ class RetryInterceptor extends Interceptor {
   /// The number of retry in case of an error
   final int retries;
 
-  /// Ignore exception if [_retryEvaluator] throws it (not recommend)
+  /// Ignore exception if [retryEvaluator] throws it (not recommend)
   final bool ignoreRetryEvaluatorExceptions;
 
   /// The delays between attempts.
@@ -76,11 +74,13 @@ class RetryInterceptor extends Interceptor {
   ///
   /// Defaults to [DefaultRetryEvaluator.evaluate]
   ///   with [defaultRetryableStatuses].
-  final RetryEvaluator _retryEvaluator;
+  final RetryEvaluator? retryEvaluator;
+
+  final RetryResEvaluator? retryResEvaluator;
 
   /// Specifies an extra retryable statuses,
   ///   which will be taken into account with [defaultRetryableStatuses]
-  /// IMPORTANT: THIS SETTING WORKS ONLY IF [_retryEvaluator] is null
+  /// IMPORTANT: THIS SETTING WORKS ONLY IF [retryEvaluator] is null
   final Set<int> retryableExtraStatuses;
 
   /// Redirects to [DefaultRetryEvaluator.evaluate]
@@ -91,20 +91,94 @@ class RetryInterceptor extends Interceptor {
 
   Future<bool> _shouldRetry(DioException error, int attempt) async {
     try {
-      return await _retryEvaluator(error, attempt);
+      return await retryEvaluator?.call(error, attempt) ?? false;
     } catch (e) {
       logPrint?.call('There was an exception in _retryEvaluator: $e');
       if (!ignoreRetryEvaluatorExceptions) {
         rethrow;
       }
     }
-    return true;
+
+    return false;
+  }
+
+  Future<bool> _shouldRetryRes(Response<dynamic> response, int attempt) async {
+    try {
+      return await retryResEvaluator?.call(response, attempt) ?? false;
+    } catch (e) {
+      logPrint?.call('There was an exception in _retryEvaluator: $e');
+      if (!ignoreRetryEvaluatorExceptions) {
+        rethrow;
+      }
+    }
+
+    return false;
   }
 
   @override
   void onRequest(RequestOptions options, RequestInterceptorHandler handler) {
     _printErrorIfRequestHasMultipartFile(options);
     super.onRequest(options, handler);
+  }
+
+  @override
+  Future<void> onResponse(
+    Response<dynamic> response,
+    ResponseInterceptorHandler handler,
+  ) async {
+    if (response.requestOptions.disableRetry) {
+      return super.onResponse(response, handler);
+    }
+
+    bool isRequestCancelled() =>
+        response.requestOptions.cancelToken?.isCancelled ?? false;
+
+    final attempt = response.requestOptions._attempt + 1;
+    final shouldRetry =
+        attempt <= retries && await _shouldRetryRes(response, attempt);
+
+    if (!shouldRetry) {
+      return super.onResponse(response, handler);
+    }
+
+    response.requestOptions._attempt = attempt;
+
+    final delay = _getDelay(attempt);
+
+    logPrint?.call(
+      '[${response.requestOptions.path}] An error occurred during request, '
+      'trying again '
+      '(attempt: $attempt/$retries, '
+      'wait ${delay.inMilliseconds} ms, '
+      'error: $response)',
+    );
+
+    var requestOptions = response.requestOptions;
+
+    if (requestOptions.data is FormData) {
+      try {
+        requestOptions = _recreateOptions(response.requestOptions);
+      } on RetryNotSupportedException {
+        rethrow;
+      }
+    }
+
+    if (delay != Duration.zero) {
+      await Future<void>.delayed(delay);
+    }
+
+    if (isRequestCancelled()) {
+      logPrint?.call('Request was cancelled. Cancel retrying.');
+      return super.onResponse(response, handler);
+    }
+
+    try {
+      await dio
+          .fetch<void>(requestOptions)
+          .then((value) => handler.resolve(value));
+    } on DioException {
+      rethrow;
+    }
   }
 
   @override
